@@ -1,0 +1,14 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
+
+[phases.setup]
+aptPkgs = [
+  "libgl1",
+  "libgl1-mesa-glx",
+  "libglu1-mesa",
+  "libxrender1",
+  "libxext6",
+  "libxi6",
+  "libsm6",
+  "libglib2.0-0"
+]
