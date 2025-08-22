@@ -1,22 +1,18 @@
-# Small, clean image
 FROM python:3.11-slim
 
-# Basics
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libgl1-mesa-glx libglu1-mesa libxrender1 libxext6 libxi6 libsm6 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Install deps
-COPY requirements.txt .
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App
-COPY app.py .
+COPY . /app
 
-# Railway will use this port
-EXPOSE 8000
-ENV PORT=8000
-
-# Start with gunicorn (no Railway start command needed)
-CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT}"]
+ENV PORT=8080
+EXPOSE 8080
+CMD ["gunicorn", "app:app", "--workers", "2", "--threads", "4", "--timeout", "120", "--bind", "0.0.0.0:8080"]
