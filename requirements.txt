@@ -1,4 +1,9 @@
 Flask==3.0.3
 Flask-Cors==4.0.0
 gunicorn==21.2.0
+
+# Pin to NumPy 1.x to avoid nptyping/compat breakages
+numpy==1.26.4
+
+# CadQuery (bundles OCP/OpenCascade)
 cadquery==2.4.0
