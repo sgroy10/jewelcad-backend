@@ -1,141 +1,165 @@
-from flask import Flask, jsonify, request, Response
+# app.py — Flask backend with strict CORS for Bolt/Railway
+
+from flask import Flask, jsonify, request, Response, make_response
 from flask_cors import CORS
 import math
-import numpy as np
-import trimesh
+import os
 
 app = Flask(__name__)
-CORS(app)
 
-# --------- helpers ---------
-def cylinder_y(radius: float, height: float, sections: int = 32) -> trimesh.Trimesh:
-    """
-    Create a cylinder aligned to Y axis, centered at origin.
-    trimesh.creation.cylinder defaults to Z; we rotate to Y for consistency.
-    """
-    m = trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
-    # rotate Z->Y (x stays x, y=z, z=-y)
-    R = trimesh.transformations.rotation_matrix(angle=math.pi/2, direction=[1, 0, 0], point=[0,0,0])
-    m.apply_transform(R)
-    return m
+# Allow everything (safe for this service). Bolt runs on a credentialless origin.
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False,
+    allow_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+    max_age=86400,
+)
 
-def cylinder_x(radius: float, length: float, sections: int = 32) -> trimesh.Trimesh:
-    """
-    Create a cylinder aligned to X axis (for post/backing disk).
-    """
-    m = trimesh.creation.cylinder(radius=radius, height=length, sections=sections)
-    # rotate Z->X
-    R = trimesh.transformations.rotation_matrix(angle=math.pi/2, direction=[0, 1, 0], point=[0,0,0])
-    m.apply_transform(R)
-    return m
+# --- helpers ---------------------------------------------------------------
 
-# --------- core generator ---------
-def build_stud_mesh(params: dict) -> trimesh.Trimesh:
-    """
-    Build a *visual* stud earring (no boolean merges; meshes are concatenated).
-    This is robust for web preview & STL export.
-    """
-    # Inputs with defaults
-    stone_d = float(params.get('stoneDiameterMm', 6.5))
-    head_style = params.get('headStyle', '4-prong')
-    prong_n = 6 if head_style == '6-prong' else 4
-    prong_t = float(params.get('prongThicknessMm', 0.9))
-    prong_h = float(params.get('prongHeightMm', 1.6))
-    post_d  = float(params.get('postDiameterMm', 0.9))
-    post_l  = float(params.get('postLengthMm', 10.0))
-    wall    = float(params.get('basketWallThicknessMm', 0.7))
-    include_disk = bool(params.get('includeBackingDisk', True))
-    disk_extra_r = float(params.get('backingDiskExtraRadiusMm', 0.25))
-    disk_thick   = float(params.get('backingDiskThicknessMm', 0.7))
+def _corsify(response: Response) -> Response:
+    """Ensure CORS headers are on every response, including binary ones."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    # If you need the browser to read Content-Disposition header:
+    response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
+    return response
 
-    # Derived sizing
-    seat_r   = stone_d * 0.5
-    rim_h    = 0.8
-    rim_r    = seat_r + 0.2 + wall   # simple outer radius for the ring
-    prong_r  = prong_t * 0.5
-    post_r   = post_d * 0.5
+@app.after_request
+def after(resp):
+    return _corsify(resp)
 
-    meshes = []
+def _preflight_ok() -> Response:
+    resp = make_response("", 204)
+    return _corsify(resp)
 
-    # 1) Rim (a thin cylinder band visually; single cylinder is OK for preview/print)
-    rim = cylinder_y(radius=rim_r, height=rim_h, sections=48)
-    # lift to around Y=rim_h/2 so base sits near Y=0
-    rim.apply_translation([0, rim_h * 0.5, 0])
-    meshes.append(rim)
+# --- health & simple ping --------------------------------------------------
 
-    # 2) Prongs (cylinders) on top of rim
-    prong_base_y = rim_h
-    for i in range(prong_n):
-        ang = 2.0 * math.pi * i / prong_n
-        px = rim_r * math.cos(ang)
-        pz = rim_r * math.sin(ang)
-        pr = cylinder_y(radius=prong_r, height=prong_h, sections=24)
-        pr.apply_translation([px, prong_base_y + prong_h * 0.5, pz])
-        meshes.append(pr)
+@app.route("/", methods=["GET", "OPTIONS"])
+def root():
+    if request.method == "OPTIONS":
+        return _preflight_ok()
+    return _corsify(jsonify({"ok": True, "service": "stud-backend"}))
 
-    # 3) Post (cylinder along +X)
-    # start just outside rim; center will be at startX + post_l/2
-    start_x = rim_r + 0.20
-    post = cylinder_x(radius=post_r, length=post_l, sections=32)
-    post.apply_translation([start_x + post_l * 0.5, rim_h * 0.5, 0])
-    meshes.append(post)
-
-    # 4) Backing disk (thin cylinder along X near the head)
-    if include_disk:
-        disk_r = rim_r + disk_extra_r
-        disk = cylinder_x(radius=disk_r, length=disk_thick, sections=64)
-        disk.apply_translation([0.15 + disk_thick * 0.5, rim_h * 0.5, 0])
-        meshes.append(disk)
-
-    # Combine to one mesh
-    combined = trimesh.util.concatenate(meshes)
-    return combined
-
-# --------- routes ---------
-@app.get('/health')
+@app.route("/health", methods=["GET", "OPTIONS"])
 def health():
-    return jsonify({"ok": True})
+    if request.method == "OPTIONS":
+        return _preflight_ok()
+    return _corsify(jsonify({"ok": True}))
 
-@app.post('/stud.stl')
-def stud_stl():
-    """
-    Accepts JSON body with stud params and returns a *binary* STL.
-    """
-    try:
-        params = request.get_json(force=True, silent=True) or {}
-        mesh = build_stud_mesh(params)
-        stl_bytes = mesh.export(file_type='stl')  # binary STL
-        return Response(
-            stl_bytes,
-            mimetype='application/octet-stream',
-            headers={'Content-Disposition': 'attachment; filename=stud.stl'}
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+@app.route("/api/ping", methods=["GET", "OPTIONS"])
+def ping():
+    if request.method == "OPTIONS":
+        return _preflight_ok()
+    return _corsify(jsonify({"pong": True}))
 
-@app.post('/stud.step')
-def stud_step_placeholder():
-    """
-    Simple placeholder STEP output so your UI's STEP button works.
-    (Proper STEP needs an OCC kernel; this is a stub.)
-    """
+# --- CAD generation (simple placeholder geometry) --------------------------
+
+@app.route("/api/generate", methods=["POST", "OPTIONS"])
+def generate():
+    if request.method == "OPTIONS":
+        return _preflight_ok()
+
+    data = request.get_json(silent=True) or {}
+
+    stone_d = float(data.get("stoneDiameterMm", 6.5))
+    head_style = data.get("headStyle", "4-prong")
+    prong_n = 6 if head_style == "6-prong" else 4
+    prong_t = float(data.get("prongThicknessMm", 0.9))
+    prong_h = float(data.get("prongHeightMm", 1.6))
+    post_d = float(data.get("postDiameterMm", 0.9))
+    post_l = float(data.get("postLengthMm", 10.0))
+
+    # Build a very simple ASCII STL (ring + prongs + post) – placeholder
+    stl = _build_ascii_stl(stone_d, prong_n, prong_t, prong_h, post_d, post_l)
+
+    resp = make_response(stl)
+    resp.headers["Content-Type"] = "application/octet-stream"
+    resp.headers["Content-Disposition"] = 'attachment; filename="stud.stl"'
+    return _corsify(resp)
+
+@app.route("/api/generate/step", methods=["POST", "OPTIONS"])
+def generate_step():
+    if request.method == "OPTIONS":
+        return _preflight_ok()
+
     step_content = """ISO-10303-21;
 HEADER;
-FILE_DESCRIPTION(('JewelCAD Stud (placeholder)'),'2;1');
+FILE_DESCRIPTION(('Stud Earring'),'2;1');
 FILE_NAME('stud.step','2025-01-01T00:00:00',(''),(''),'','','');
 FILE_SCHEMA(('AP203'));
 ENDSEC;
 DATA;
+#1=CLOSED_SHELL('',());
 ENDSEC;
 END-ISO-10303-21;"""
-    return Response(
-        step_content,
-        mimetype='application/step',
-        headers={'Content-Disposition': 'attachment; filename=stud.step'}
-    )
 
-if __name__ == '__main__':
-    # Local dev run (Railway uses gunicorn via Dockerfile)
-    import os
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+    resp = make_response(step_content)
+    resp.headers["Content-Type"] = "application/step"
+    resp.headers["Content-Disposition"] = 'attachment; filename="stud.step"'
+    return _corsify(resp)
+
+# --- naive STL builder (same spirit as your previous placeholder) ----------
+
+def _build_ascii_stl(stone_d, prong_n, prong_t, prong_h, post_d, post_l) -> str:
+    lines = ["solid stud\n"]
+
+    rim_r = stone_d / 2 + 0.6
+    rim_h = 0.8
+
+    # crude ring side wall (8 segments)
+    for i in range(8):
+        a1 = i * math.pi / 4
+        a2 = (i + 1) * math.pi / 4
+        x1, z1 = rim_r * math.cos(a1), rim_r * math.sin(a1)
+        x2, z2 = rim_r * math.cos(a2), rim_r * math.sin(a2)
+        # two triangles per quad
+        lines += _tri((x1, 0, z1), (x2, 0, z2), (x2, rim_h, z2))
+        lines += _tri((x1, 0, z1), (x2, rim_h, z2), (x1, rim_h, z1))
+
+    # prongs as tiny boxes
+    half_t = prong_t / 2.0
+    for i in range(prong_n):
+        a = i * 2 * math.pi / prong_n
+        px, pz = rim_r * math.cos(a), rim_r * math.sin(a)
+        y0, y1 = rim_h, rim_h + prong_h
+        # front
+        lines += _tri((px-half_t, y0, pz-half_t), (px+half_t, y0, pz-half_t), (px+half_t, y1, pz-half_t))
+        lines += _tri((px-half_t, y0, pz-half_t), (px+half_t, y1, pz-half_t), (px-half_t, y1, pz-half_t))
+        # back
+        lines += _tri((px-half_t, y0, pz+half_t), (px+half_t, y1, pz+half_t), (px+half_t, y0, pz+half_t))
+        lines += _tri((px-half_t, y0, pz+half_t), (px-half_t, y1, pz+half_t), (px+half_t, y1, pz+half_t))
+
+    # post as box on +X
+    post_r = post_d / 2.0
+    sx = rim_r + 0.6
+    # top
+    lines += _tri((sx,  post_r, -post_r), (sx+post_l, post_r, -post_r), (sx+post_l, post_r, post_r))
+    lines += _tri((sx,  post_r, -post_r), (sx+post_l, post_r, post_r), (sx, post_r,  post_r))
+    # bottom
+    lines += _tri((sx, -post_r, -post_r), (sx+post_l, -post_r,  post_r), (sx+post_l, -post_r, -post_r))
+    lines += _tri((sx, -post_r, -post_r), (sx,      -post_r,  post_r), (sx+post_l, -post_r,  post_r))
+
+    lines.append("endsolid stud\n")
+    return "".join(lines)
+
+def _tri(v1, v2, v3):
+    return [
+        "  facet normal 0 0 0\n",
+        "    outer loop\n",
+        f"      vertex {v1[0]:.4f} {v1[1]:.4f} {v1[2]:.4f}\n",
+        f"      vertex {v2[0]:.4f} {v2[1]:.4f} {v2[2]:.4f}\n",
+        f"      vertex {v3[0]:.4f} {v3[1]:.4f} {v3[2]:.4f}\n",
+        "    endloop\n",
+        "  endfacet\n",
+    ]
+
+# --- entrypoint ------------------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
