@@ -1,4 +1,4 @@
-cadquery==2.4.0
-Flask==3.0.3
-flask-cors==4.0.1
-gunicorn==22.0.0
+Flask==3.0.2
+Flask-Cors==4.0.0
+trimesh==4.4.3
+numpy==1.26.4
