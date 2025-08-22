@@ -1,19 +1,7 @@
-# Dockerfile — bookworm-safe, headless
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-
-# Minimal runtime libs (no libgl1-mesa-glx)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglu1-mesa \
-    libxrender1 \
-    libxext6 \
-    libxi6 \
-    libsm6 \
-    libglib2.0-0 \
- && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
