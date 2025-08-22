@@ -1,5 +1,5 @@
-uvicorn[standard]==0.30.5
-fastapi==0.111.1
-numpy==1.26.4
+Flask==3.0.3
+Flask-Cors==4.0.0
 trimesh==4.4.0
-pydantic==2.8.2
+numpy==1.26.4
+gunicorn==21.2.0
