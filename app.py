@@ -1,21 +1,21 @@
-# app.py — JewelCAD backend on CadQuery/OpenCascade (solid modeling)
+# app.py — CadQuery backend (OpenCascade) for a 4/6-prong basket stud
 # Endpoints:
 #   GET  /health
 #   POST /api/generate        -> STL (attachment)
 #   POST /api/generate/step   -> STEP (attachment)
 #
-# Notes:
-# - Solid/boolean modeling (no trimesh). Clean, manifold solids.
-# - Built in Z-up for robustness, then rotated to Y-up so:
-#     basket axis = +Y, post = +X  (matches your viewer)
-# - Parametric: stoneDiameterMm, seatClearanceMm, basketWallThicknessMm,
-#   prongCount (4/6), prongThicknessMm, prongHeightMm, postDiameterMm,
-#   postLengthMm, includeBackingDisk, backDiskExtraRadius, backDiskThickness
+# Built for headless server use (Railway). Uses solid booleans/fillets and
+# outputs clean, manifold STL and true STEP (AP203).
+#
+# Coordinate convention for your viewer:
+#   - Basket axis  : +Y (Y-up)
+#   - Post axis    : +X
+#
+# Default params target a round 6.0 mm stone and should already look “right”.
 
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import os
-import io
 import math
 import tempfile
 import cadquery as cq
@@ -24,15 +24,21 @@ from cadquery import exporters
 app = Flask(__name__)
 CORS(app)
 
-# ---------------------- helpers ----------------------
+# ---------- small helpers ----------
 
-def _to_float(d, key, default):
+def _f(d, key, default):
     try:
         return float(d.get(key, default))
     except Exception:
         return float(default)
 
-def _to_bool(d, key, default):
+def _i(d, key, default):
+    try:
+        return int(d.get(key, default))
+    except Exception:
+        return int(default)
+
+def _b(d, key, default):
     v = d.get(key, default)
     if isinstance(v, bool):
         return v
@@ -41,112 +47,136 @@ def _to_bool(d, key, default):
     return bool(v)
 
 def _export_bytes(shape, kind: str) -> bytes:
-    """
-    kind: 'stl' or 'step'
-    """
+    """kind in {'stl','step'}"""
     assert kind in ("stl", "step")
     suffix = ".stl" if kind == "stl" else ".step"
     with tempfile.NamedTemporaryFile(suffix=suffix) as tf:
         if kind == "stl":
-            # tight but safe tolerances; mm units
+            # tight tolerances but safe for web
             exporters.export(shape, tf.name, tolerance=0.001, angularTolerance=0.1)
         else:
             exporters.export(shape, tf.name)
         tf.seek(0)
         return tf.read()
 
-# ---------------------- CAD logic ----------------------
+# ---------- core CAD ----------
 
 def build_stud(params: dict) -> cq.Workplane:
-    # ---- inputs (mm) ----
-    stone_d   = _to_float(params, 'stoneDiameterMm', 6.0)
-    seat_cl   = _to_float(params, 'seatClearanceMm', 0.15)     # clearance between stone & seat
-    wall_th   = _to_float(params, 'basketWallThicknessMm', 0.8)
-    rim_h     = _to_float(params, 'rimHeightMm', 1.10)
+    # -------- inputs (mm) --------
+    stone_d    = _f(params, "stoneDiameterMm", 6.0)
+    seat_cl    = _f(params, "seatClearanceMm", 0.15)  # stone - seat OD clearance
+    wall_th    = _f(params, "basketWallThicknessMm", 0.80)
+    rim_h      = _f(params, "rimHeightMm", 1.10)
 
-    prong_n   = int(params.get('prongCount', 4))
+    prong_n    = _i(params, "prongCount", 4)
     if prong_n not in (4, 6): prong_n = 4
-    prong_t   = _to_float(params, 'prongThicknessMm', 0.9)     # square-ish or round section proxy
-    prong_r   = max(0.25, 0.5 * prong_t)                       # round approximation
-    prong_h   = _to_float(params, 'prongHeightMm', max(1.2, 0.32*stone_d))
-    tilt_deg  = _to_float(params, 'prongTiltDeg', 18)
+    prong_t    = _f(params, "prongThicknessMm", 0.90)  # round section proxy
+    prong_r    = max(0.20, 0.5 * prong_t)
+    prong_h    = _f(params, "prongHeightMm", max(1.2, 0.32 * stone_d))
+    prong_tilt = _f(params, "prongTiltDeg", 20.0)
 
-    post_d    = _to_float(params, 'postDiameterMm', 0.9)
-    post_len  = _to_float(params, 'postLengthMm', 10.0)
-    post_r    = max(0.25, post_d/2.0)
+    # prong “foot” pad sitting on rim top (visually cleaner joint)
+    pad_w      = _f(params, "prongPadWidthMm", 0.90)   # along tangent (Y at +X prong)
+    pad_d      = _f(params, "prongPadDepthMm", 0.60)   # radial depth onto rim top
+    pad_h      = _f(params, "prongPadHeightMm", 0.25)
+    pad_fillet = _f(params, "prongPadFilletMm", 0.10)
 
-    use_disk  = _to_bool(params, 'includeBackingDisk', True)
-    disk_extra= _to_float(params, 'backDiskExtraRadius', 0.25)
-    disk_t    = _to_float(params, 'backDiskThickness', 0.7)
+    post_d     = _f(params, "postDiameterMm", 0.90)
+    post_len   = _f(params, "postLengthMm", 10.0)
+    post_r     = max(0.20, post_d / 2.0)
 
-    # rails/seat defaults
-    rail_w    = _to_float(params, 'railWidthMm', 0.7)
-    rail_h    = _to_float(params, 'railHeightMm', 0.7)
+    use_disk   = _b(params, "includeBackingDisk", True)
+    disk_extra = _f(params, "backDiskExtraRadius", 0.25)
+    disk_t     = _f(params, "backDiskThickness", 0.70)
 
-    # ---- derived ----
-    # inner seat diameter slightly smaller than stone so it sits; clearance reduces seat OD
-    seat_d    = max(1.0, stone_d - seat_cl)
-    rim_inner = max(1.5, seat_d/2.0 - 0.05)                    # leave small ledge
-    rim_outer = rim_inner + wall_th
-    rim_OD    = 2.0 * rim_outer
-    rim_ID    = 2.0 * rim_inner
+    # -------- derived --------
+    seat_d     = max(1.0, stone_d - seat_cl)          # seat ring OD
+    rim_inner  = max(1.4, seat_d / 2.0 - 0.05)        # small bearing ledge
+    rim_outer  = rim_inner + wall_th
+    rim_ID     = 2.0 * rim_inner
 
-    # ---- 1) Basket rim (band) ----
+    # -------- 1) Basket rim (band) --------
     rim = (
         cq.Workplane("XY")
         .circle(rim_outer)
         .extrude(rim_h)
         .cut(cq.Workplane("XY").circle(rim_inner).extrude(rim_h + 0.05))
-    ).translate((0, 0, -rim_h/2.0))  # center about Z=0
+        .translate((0, 0, -rim_h/2.0))                 # Z centered about 0
+    )
 
-    # ---- 2) Cross rails (gallery/seat) inside rim ----
+    # soften outer top/bottom edges slightly
+    try:
+        rim = rim.edges(">Z or <Z").fillet(0.08)
+    except Exception:
+        pass
+
+    # -------- 2) Seat rails (cross) --------
+    rail_w = _f(params, "railWidthMm", 0.70)
+    rail_h = _f(params, "railHeightMm", 0.70)
     rail_len = rim_ID * 0.96
-    z_pos    = -0.05  # slightly below mid-plane
+    z_pos = -0.05  # just below rim mid-plane for a subtle shadow split
+
     rail_x = cq.Workplane("XY").box(rail_len, rail_w, rail_h).translate((0, 0, z_pos))
     rail_y = cq.Workplane("XY").box(rail_w, rail_len, rail_h).translate((0, 0, z_pos))
-    rails = rail_x.union(rail_y)
+    body = rim.union(rail_x.union(rail_y))
 
-    body = rim.union(rails)
-
-    # ---- 3) Prongs (round section, tilted inward) ----
-    # Build one prong at +X, then polar copy about Z.
-    z_top = rim_h/2.0
+    # -------- 3) Prong + pad at +X, then polar array --------
+    z_top = rim_h / 2.0
     base_x = rim_outer
     base_y = 0.0
 
-    pr0 = (
+    # Pad sits on top face of rim
+    pad = (
+        cq.Workplane("XY")
+        .center(base_x - pad_d/2.0, base_y)           # center so inner edge ~ at rim_outer - pad_d
+        .rect(pad_d, pad_w)
+        .extrude(pad_h)
+        .translate((0, 0, z_top))
+    )
+    # soften pad edges
+    try:
+        pad = pad.edges("|Z").fillet(min(0.5*pad_w, pad_fillet))
+    except Exception:
+        pass
+
+    # Prong grows upward from pad top, then tilts inward
+    pr_base_z = z_top + pad_h
+    pr = (
         cq.Workplane("XY")
         .center(base_x, base_y)
         .circle(prong_r)
         .extrude(prong_h)
-        .translate((0, 0, z_top))  # base sits on rim top
+        .translate((0, 0, pr_base_z))
     )
-    # tilt about local tangential axis (+Y) at the base point
-    pr0 = pr0.rotate((base_x, base_y, z_top), (base_x, base_y + 1.0, z_top), -tilt_deg)
+    # Tilt around tangent axis at +X (tangent = +Y there)
+    pr = pr.rotate(
+        (base_x, base_y, pr_base_z),
+        (base_x, base_y + 1.0, pr_base_z),
+        -prong_tilt
+    )
 
-    pr_solid = pr0.val()
-    prongs_wp = cq.Workplane("XY")
-    step_deg = 360 // prong_n
-    for a in range(0, 360, step_deg):
-        prongs_wp = prongs_wp.add(pr_solid.rotate((0, 0, 0), (0, 0, 1), a))
-    prongs_wp = prongs_wp.combineSolids()
-    body = body.union(prongs_wp)
+    prong_unit = pad.union(pr)
+    prongs = cq.Workplane("XY")
+    step = 360 // prong_n
+    unit = prong_unit.val()
+    for ang in range(0, 360, step):
+        prongs = prongs.add(unit.rotate((0, 0, 0), (0, 0, 1), ang))
+    prongs = prongs.combineSolids()
+    body = body.union(prongs)
 
-    # ---- 4) Post along +X, anchored at rim outer face mid-height ----
-    # Place the YZ workplane at X = rim_outer + small gap; extrude +X.
-    post_offset_x = rim_outer + 0.15
+    # -------- 4) Post along +X from mid-height of basket back --------
+    post_offset_x = rim_outer + 0.15  # small gap into the band
     post = (
         cq.Workplane("YZ")
         .workplane(offset=post_offset_x)
         .circle(post_r)
-        .extrude(post_len)  # +X direction
+        .extrude(post_len)  # +X
     )
     body = body.union(post)
 
-    # ---- 5) Backing disk (optional), coaxial with post ----
+    # -------- 5) Back disk (optional) --------
     if use_disk:
         disk_r = rim_outer + disk_extra
-        # Put disk so its mid-plane touches the basket face; extrude thinly in +X.
         disk = (
             cq.Workplane("YZ")
             .workplane(offset=post_offset_x - disk_t)
@@ -155,47 +185,35 @@ def build_stud(params: dict) -> cq.Workplane:
         )
         body = body.union(disk)
 
-    # ---- 6) Gentle fillets for nicer look (best-effort; keep tiny) ----
-    try:
-        body = body.edges(">Z or <Z").fillet(0.08)  # rim top/bottom outer edges
-    except Exception:
-        pass
-    try:
-        body = body.edges("|Z").fillet(0.05)       # vertical edges (rails)
-    except Exception:
-        pass
-
-    # ---- 7) Orient to Y-up for your viewer: Z->Y (rotate -90° about X) ----
+    # -------- 6) Orient to Y-up for your viewer (Z->Y) --------
     body = body.rotate((0, 0, 0), (1, 0, 0), -90)
 
     return body
 
-# ---------------------- routes ----------------------
+# ---------- routes ----------
 
-@app.get('/health')
+@app.get("/health")
 def health():
     return jsonify({"ok": True})
 
-@app.post('/api/generate')
+@app.post("/api/generate")
 def api_generate():
     params = request.get_json(silent=True) or {}
     model = build_stud(params)
-
-    stl_bytes = _export_bytes(model, "stl")
+    data = _export_bytes(model, "stl")
     return Response(
-        stl_bytes,
+        data,
         mimetype="application/octet-stream",
         headers={"Content-Disposition": 'attachment; filename="stud.stl"'}
     )
 
-@app.post('/api/generate/step')
+@app.post("/api/generate/step")
 def api_generate_step():
     params = request.get_json(silent=True) or {}
     model = build_stud(params)
-
-    step_bytes = _export_bytes(model, "step")
+    data = _export_bytes(model, "step")
     return Response(
-        step_bytes,
+        data,
         mimetype="application/step",
         headers={"Content-Disposition": 'attachment; filename="stud.step"'}
     )
